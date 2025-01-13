@@ -1,0 +1,366 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$logFile = Join-Path $PSScriptRoot "PrinterMigration_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$global:logText = ""
+
+# Define colors for log entries
+$colors = @{
+    Success = "#4CAF50"  # Green
+    Error = "#F44336"    # Red
+    Info = "#2196F3"     # Blue
+    Warning = "#FF9800"  # Orange
+}
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Type = "Info" # Success, Error, Info, Warning
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] $Message"
+    $global:logText += "$logMessage`r`n"
+    
+    # Set color based on message type
+    $color = switch($Type) {
+        "Success" { $colors.Success }
+        "Error" { $colors.Error }
+        "Warning" { $colors.Warning }
+        default { $colors.Info }
+    }
+    
+    $gridView.Rows.Add($timestamp, $Type, $Message)
+    $lastIndex = $gridView.Rows.Count - 1
+    $gridView.Rows[$lastIndex].DefaultCellStyle.ForeColor = [System.Drawing.ColorTranslator]::FromHtml($color)
+    $gridView.FirstDisplayedScrollingRowIndex = $lastIndex
+    
+    Add-Content -Path $logFile -Value $logMessage
+}
+
+# Function to pre-fetch all printer data from a server
+function Get-AllPrinterData {
+    param ($ServerName)
+    
+    try {
+        Write-Log "Fetching all printer data from $ServerName" "Info"
+        
+        $data = @{
+            Printers = Get-Printer -ComputerName $ServerName
+            Ports = Get-PrinterPort -ComputerName $ServerName
+            SNMPPorts = Get-WmiObject -Class "Win32_TCPIPPrinterPort" -Namespace "root\CIMV2" -ComputerName $ServerName
+        }
+        
+        Write-Log "Retrieved $($data.Printers.Count) printers, $($data.Ports.Count) ports from $ServerName" "Success"
+        return $data
+    }
+    catch {
+        Write-Log "Failed to fetch data from $ServerName : $_" "Error"
+        return $null
+    }
+}
+
+# Function to set SNMP settings using WMI
+function Set-SNMPSettings {
+    param (
+        $ComputerName,
+        $PortName,
+        $SNMPEnabled,
+        $SNMPDevIndex,
+        $CommunityName
+    )
+    try {
+        $port = Get-WmiObject -Class "Win32_TCPIPPrinterPort" -Namespace "root\CIMV2" `
+            -ComputerName $ComputerName | Where-Object { $_.Name -eq $PortName }
+        
+        if ($port) {
+            Write-Log "Setting SNMP values for port $PortName" "Info"
+            Write-Log "SNMP Enabled: $SNMPEnabled" "Info"
+            Write-Log "SNMP Index: $SNMPDevIndex" "Info"
+            Write-Log "Community: $CommunityName" "Info"
+
+            $port.SNMPEnabled = $SNMPEnabled
+            if ($SNMPEnabled) {
+                $port.SNMPDeviceIndex = $SNMPDevIndex
+                $port.Community = $CommunityName
+            }
+            $port.Put() | Out-Null
+            Write-Log "SNMP settings updated successfully" "Success"
+        }
+    }
+    catch {
+        Write-Log "Failed to set SNMP settings: $_" "Error"
+    }
+}
+
+# Function to get advanced printer settings
+function Get-AdvancedPrinterSettings {
+    param (
+        $ComputerName,
+        $PrinterName
+    )
+    try {
+        $printer = Get-WmiObject -Class "Win32_Printer" -Namespace "root\CIMV2" `
+            -ComputerName $ComputerName | Where-Object { $_.Name -eq $PrinterName }
+        
+        if ($printer) {
+            return @{
+                PrintSpooledDocumentsFirst = $printer.PrintSpooledDocumentsFirst
+                KeepPrintedJobs = $printer.KeepPrintedJobs
+                WorkOffline = $printer.WorkOffline
+                EnableBIDI = $printer.EnableBIDI
+                DoCompleteFirst = $printer.DoCompleteFirst
+                EnableDevQueryPrint = $printer.EnableDevQueryPrint
+                RawOnly = $printer.RawOnly
+                Published = $printer.Published
+                Queued = $printer.Queued
+                Direct = $printer.Direct
+                StartTime = $printer.StartTime
+                UntilTime = $printer.UntilTime
+                DefaultPriority = $printer.DefaultPriority
+                Priority = $printer.Priority
+                ScheduledPrintingSupported = $printer.ScheduledPrintingSupported
+            }
+        }
+        return $null
+    }
+    catch {
+        Write-Log "Failed to get advanced printer settings: $_" "Error"
+        return $null
+    }
+}
+
+# Function to set advanced printer settings
+function Set-AdvancedPrinterSettings {
+    param (
+        $ComputerName,
+        $PrinterName,
+        $Settings
+    )
+    try {
+        $printer = Get-WmiObject -Class "Win32_Printer" -Namespace "root\CIMV2" `
+            -ComputerName $ComputerName | Where-Object { $_.Name -eq $PrinterName }
+        
+        if ($printer -and $Settings) {
+            Write-Log "Setting advanced printer settings for $PrinterName" "Info"
+            
+            foreach ($property in $Settings.Keys) {
+                if ($null -ne $Settings[$property]) {
+                    $printer.$property = $Settings[$property]
+                    Write-Log "$property : $($Settings[$property])" "Info"
+                }
+            }
+
+            $printer.Put() | Out-Null
+            Write-Log "Advanced printer settings updated successfully" "Success"
+        }
+    }
+    catch {
+        Write-Log "Failed to set advanced printer settings: $_" "Error"
+    }
+}
+
+# Function to copy device settings using PrintUI
+function Copy-PrinterDeviceSettings {
+    param (
+        $SourceServer,
+        $SourcePrinter,
+        $DestServer,
+        $DestPrinter
+    )
+    try {
+        Write-Log "Copying device settings using PrintUI" "Info"
+        
+        # Export source printer settings to a temporary file
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        $arguments = "/Ss /n `"\\$SourceServer\$SourcePrinter`" /f `"$tempFile`""
+        
+        Start-Process "printui.dll" -ArgumentList $arguments -Wait
+        
+        # Import settings to destination printer
+        $arguments = "/Sr /n `"\\$DestServer\$DestPrinter`" /f `"$tempFile`""
+        Start-Process "printui.dll" -ArgumentList $arguments -Wait
+        
+        # Clean up temp file
+        Remove-Item $tempFile -Force
+        
+        Write-Log "Device settings copied successfully" "Success"
+    }
+    catch {
+        Write-Log "Failed to copy device settings: $_" "Error"
+    }
+}
+
+# Create Form and Controls
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Printer Migration Tool"
+$form.Size = New-Object System.Drawing.Size(1000,600)
+$form.StartPosition = "CenterScreen"
+
+$button = New-Object System.Windows.Forms.Button
+$button.Location = New-Object System.Drawing.Point(20,20)
+$button.Size = New-Object System.Drawing.Size(150,30)
+$button.Text = "Select CSV File"
+$form.Controls.Add($button)
+
+$progressBar = New-Object System.Windows.Forms.ProgressBar
+$progressBar.Location = New-Object System.Drawing.Point(190,20)
+$progressBar.Size = New-Object System.Drawing.Size(400,30)
+$form.Controls.Add($progressBar)
+
+$copyButton = New-Object System.Windows.Forms.Button
+$copyButton.Location = New-Object System.Drawing.Point(610,20)
+$copyButton.Size = New-Object System.Drawing.Size(150,30)
+$copyButton.Text = "Copy Log"
+$form.Controls.Add($copyButton)
+
+# Grid View for logging
+$gridView = New-Object System.Windows.Forms.DataGridView
+$gridView.Location = New-Object System.Drawing.Point(20,70)
+$gridView.Size = New-Object System.Drawing.Size(940,470)
+$gridView.BackgroundColor = [System.Drawing.Color]::White
+$gridView.ColumnHeadersBorderStyle = "Single"
+$gridView.CellBorderStyle = "Single"
+$gridView.GridColor = [System.Drawing.Color]::LightGray
+$gridView.RowHeadersVisible = $false
+$gridView.AllowUserToAddRows = $false
+$gridView.AllowUserToDeleteRows = $false
+$gridView.AllowUserToResizeRows = $false
+$gridView.MultiSelect = $false
+$gridView.SelectionMode = "FullRowSelect"
+$gridView.AutoSizeColumnsMode = "Fill"
+$gridView.ColumnCount = 3
+$gridView.Columns[0].Name = "Timestamp"
+$gridView.Columns[1].Name = "Type"
+$gridView.Columns[2].Name = "Message"
+$form.Controls.Add($gridView)
+
+$copyButton.Add_Click({
+    [System.Windows.Forms.Clipboard]::SetText($global:logText)
+    Write-Log "Log copied to clipboard" "Success"
+})
+
+$button.Add_Click({
+    $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+    $openFileDialog.Filter = "CSV Files (*.csv)|*.csv"
+    if($openFileDialog.ShowDialog() -eq 'OK') {
+        Write-Log "Starting printer migration process" "Info"
+        Write-Log "Loading CSV file: $($openFileDialog.FileName)" "Info"
+        
+        $printers = Import-Csv $openFileDialog.FileName
+        $progressBar.Maximum = $printers.Count
+        $progressBar.Value = 0
+
+        # Get unique source and destination servers
+        $sourceServers = $printers | Select-Object -ExpandProperty sourceserver -Unique
+        $destServers = $printers | Select-Object -ExpandProperty dstserver -Unique
+
+        # Pre-fetch all printer data
+        $serverData = @{}
+        foreach ($server in $sourceServers) {
+            Write-Log "Pre-fetching data from source server: $server" "Info"
+            $serverData[$server] = Get-AllPrinterData -ServerName $server
+        }
+        foreach ($server in $destServers) {
+            if (-not $serverData[$server]) {
+                Write-Log "Pre-fetching data from destination server: $server" "Info"
+                $serverData[$server] = Get-AllPrinterData -ServerName $server
+            }
+        }
+
+        foreach($printer in $printers) {
+            try {
+                Write-Log "Processing printer migration:" "Info"
+                Write-Log "Source: $($printer.sourceserver)\$($printer.sourcename)" "Info"
+                Write-Log "Target: $($printer.dstserver)\$($printer.targetname)" "Info"
+                
+                # Get source printer from cached data
+                $sourcePrinter = $serverData[$printer.sourceserver].Printers | 
+                    Where-Object { $_.Name -eq $printer.sourcename }
+                
+                if (-not $sourcePrinter) {
+                    throw "Source printer not found"
+                }
+                
+                # Get source port from cached data
+                $sourcePort = $serverData[$printer.sourceserver].Ports | 
+                    Where-Object { $_.Name -eq $sourcePrinter.PortName }
+                
+                # Get SNMP settings from cached data
+                $sourceSNMP = $serverData[$printer.sourceserver].SNMPPorts | 
+                    Where-Object { $_.Name -eq $sourcePort.Name }
+
+                # Get advanced settings from source printer
+                Write-Log "Getting advanced settings from source printer" "Info"
+                $advancedSettings = Get-AdvancedPrinterSettings -ComputerName $printer.sourceserver -PrinterName $printer.sourcename
+
+                Write-Log "Retrieved source configurations" "Success"
+                if ($sourceSNMP.SNMPEnabled) {
+                    Write-Log "SNMP Enabled: True" "Info"
+                    Write-Log "SNMP Index: $($sourceSNMP.SNMPDeviceIndex)" "Info"
+                    Write-Log "Community: $($sourceSNMP.Community)" "Info"
+                }
+
+                # Check if port exists in destination cached data
+                $destPort = $serverData[$printer.dstserver].Ports | 
+                    Where-Object { $_.Name -eq $sourcePort.Name }
+
+                if (-not $destPort) {
+                    Write-Log "Creating port $($sourcePort.Name) on destination server" "Info"
+                    Add-PrinterPort -ComputerName $printer.dstserver -Name $sourcePort.Name -PrinterHostAddress $sourcePort.PrinterHostAddress
+                    
+                    if ($sourceSNMP.SNMPEnabled) {
+                        Write-Log "Configuring SNMP settings on destination port" "Info"
+                        Set-SNMPSettings -ComputerName $printer.dstserver `
+                            -PortName $sourcePort.Name `
+                            -SNMPEnabled $sourceSNMP.SNMPEnabled `
+                            -SNMPDevIndex $sourceSNMP.SNMPDeviceIndex `
+                            -CommunityName $sourceSNMP.Community
+                    }
+                }
+
+                Write-Log "Creating printer with following settings:" "Info"
+                Write-Log "Driver: $($sourcePrinter.DriverName)" "Info"
+                Write-Log "Port: $($sourcePort.Name)" "Info"
+                Write-Log "Location: $($sourcePrinter.Location)" "Info"
+
+                Add-Printer -ComputerName $printer.dstserver -Name $printer.targetname `
+                    -DriverName $sourcePrinter.DriverName `
+                    -PortName $sourcePort.Name `
+                    -Location $sourcePrinter.Location `
+                    -Comment $sourcePrinter.Comment `
+                    -Shared:$sourcePrinter.Shared `
+                    -ShareName $sourcePrinter.ShareName
+
+                # Wait for printer creation
+                Start-Sleep -Seconds 2
+
+                # Apply advanced settings
+                if ($advancedSettings) {
+                    Write-Log "Applying advanced settings to destination printer" "Info"
+                    Set-AdvancedPrinterSettings -ComputerName $printer.dstserver -PrinterName $printer.targetname -Settings $advancedSettings
+                }
+
+                # Copy device settings
+                Write-Log "Copying device settings" "Info"
+                Copy-PrinterDeviceSettings -SourceServer $printer.sourceserver `
+                                         -SourcePrinter $printer.sourcename `
+                                         -DestServer $printer.dstserver `
+                                         -DestPrinter $printer.targetname
+
+                Write-Log "Successfully created printer $($printer.targetname)" "Success"
+                $progressBar.Value++
+            }
+            catch {
+                Write-Log "Failed processing $($printer.sourcename)" "Error"
+                Write-Log "Error Details: $_" "Error"
+            }
+            Write-Log "----------------------------------------" "Info"
+        }
+        Write-Log "Migration process completed" "Success"
+        Write-Log "Log file saved to: $logFile" "Success"
+    }
+})
+
+Write-Log "Printer Migration Tool Started" "Info"
+Write-Log "Log file will be saved to: $logFile" "Info"
+$form.ShowDialog()
