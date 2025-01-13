@@ -172,15 +172,22 @@ function Copy-PrinterDeviceSettings {
         
         # Export source printer settings to a temporary file
         $tempFile = [System.IO.Path]::GetTempFileName()
-        $arguments = "/Ss /n `"\\$SourceServer\$SourcePrinter`" /f `"$tempFile`""
         
-        Start-Process "printui.dll" -ArgumentList $arguments -Wait
+        # Use rundll32 to call printui.dll
+        $exportCmd = "rundll32 printui.dll,PrintUIEntry /Ss /n `"\\$SourceServer\$SourcePrinter`" /f `"$tempFile`""
+        $importCmd = "rundll32 printui.dll,PrintUIEntry /Sr /n `"\\$DestServer\$DestPrinter`" /f `"$tempFile`""
         
-        # Import settings to destination printer
-        $arguments = "/Sr /n `"\\$DestServer\$DestPrinter`" /f `"$tempFile`""
-        Start-Process "printui.dll" -ArgumentList $arguments -Wait
+        Write-Log "Exporting source printer settings..." "Info"
+        Invoke-Expression $exportCmd
+        
+        # Wait a moment for the export to complete
+        Start-Sleep -Seconds 2
+        
+        Write-Log "Importing settings to destination printer..." "Info"
+        Invoke-Expression $importCmd
         
         # Clean up temp file
+        Start-Sleep -Seconds 2
         Remove-Item $tempFile -Force
         
         Write-Log "Device settings copied successfully" "Success"
